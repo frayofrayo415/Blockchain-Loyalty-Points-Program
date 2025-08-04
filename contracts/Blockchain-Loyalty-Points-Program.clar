@@ -534,3 +534,259 @@
         (ok (>= stacks-block-height (get expiry-block points-data)))
     )
 )
+
+(define-constant ERR-REWARD-NOT-FOUND (err u110))
+(define-constant ERR-REWARD-INACTIVE (err u111))
+(define-constant ERR-REWARD-ALREADY-CLAIMED (err u112))
+(define-constant ERR-INSUFFICIENT-BURN-POINTS (err u113))
+
+(define-data-var reward-id-counter uint u0)
+
+(define-map BurnRewards
+    uint
+    {
+        partner: principal,
+        title: (string-ascii 64),
+        burn-cost: uint,
+        max-claims: uint,
+        current-claims: uint,
+        active: bool,
+        tier-requirement: uint,
+    }
+)
+
+(define-map UserBurnClaims
+    {
+        user: principal,
+        reward-id: uint,
+    }
+    { claimed: bool }
+)
+
+(define-map PartnerBurnStats
+    principal
+    {
+        total-burns: uint,
+        total-rewards-created: uint,
+    }
+)
+
+(define-map UserBurnHistory
+    principal
+    {
+        total-burned: uint,
+        rewards-claimed: uint,
+    }
+)
+
+(define-public (create-burn-reward
+        (title (string-ascii 64))
+        (burn-cost uint)
+        (max-claims uint)
+        (tier-requirement uint)
+    )
+    (let (
+            (reward-id (+ (var-get reward-id-counter) u1))
+            (partner-data (unwrap! (map-get? Partners tx-sender) ERR-PARTNER-NOT-FOUND))
+        )
+        (asserts! (get active partner-data) ERR-NOT-AUTHORIZED)
+        (asserts! (> burn-cost u0) ERR-INVALID-AMOUNT)
+        (asserts! (> max-claims u0) ERR-INVALID-AMOUNT)
+        (asserts! (<= tier-requirement TIER-PLATINUM) ERR-INVALID-TIER)
+        (map-set BurnRewards reward-id {
+            partner: tx-sender,
+            title: title,
+            burn-cost: burn-cost,
+            max-claims: max-claims,
+            current-claims: u0,
+            active: true,
+            tier-requirement: tier-requirement,
+        })
+        (let ((current-stats (default-to {
+                total-burns: u0,
+                total-rewards-created: u0,
+            }
+                (map-get? PartnerBurnStats tx-sender)
+            )))
+            (map-set PartnerBurnStats tx-sender
+                (merge current-stats { total-rewards-created: (+ (get total-rewards-created current-stats) u1) })
+            )
+        )
+        (var-set reward-id-counter reward-id)
+        (ok reward-id)
+    )
+)
+
+(define-public (claim-burn-reward (reward-id uint))
+    (let (
+            (reward-data (unwrap! (map-get? BurnRewards reward-id) ERR-REWARD-NOT-FOUND))
+            (user-tier-data (default-to {
+                current-tier: TIER-BRONZE,
+                tier-points: u0,
+                tier-multiplier: u100,
+            }
+                (map-get? UserTiers tx-sender)
+            ))
+            (user-points (unwrap!
+                (map-get? UserPoints {
+                    user: tx-sender,
+                    partner: (get partner reward-data),
+                })
+                ERR-USER-NOT-FOUND
+            ))
+            (already-claimed (default-to { claimed: false }
+                (map-get? UserBurnClaims {
+                    user: tx-sender,
+                    reward-id: reward-id,
+                })
+            ))
+        )
+        (asserts! (get active reward-data) ERR-REWARD-INACTIVE)
+        (asserts! (not (get claimed already-claimed)) ERR-REWARD-ALREADY-CLAIMED)
+        (asserts!
+            (< (get current-claims reward-data) (get max-claims reward-data))
+            ERR-REWARD-INACTIVE
+        )
+        (asserts!
+            (>= (get current-tier user-tier-data)
+                (get tier-requirement reward-data)
+            )
+            ERR-TIER-NOT-QUALIFIED
+        )
+        (asserts! (>= (get balance user-points) (get burn-cost reward-data))
+            ERR-INSUFFICIENT-BURN-POINTS
+        )
+        (unwrap!
+            (deduct-points tx-sender (get partner reward-data)
+                (get burn-cost reward-data)
+            )
+            ERR-INSUFFICIENT-POINTS
+        )
+        (unwrap! (deduct-from-total tx-sender (get burn-cost reward-data))
+            ERR-INSUFFICIENT-POINTS
+        )
+        (map-set BurnRewards reward-id
+            (merge reward-data { current-claims: (+ (get current-claims reward-data) u1) })
+        )
+        (map-set UserBurnClaims {
+            user: tx-sender,
+            reward-id: reward-id,
+        } { claimed: true }
+        )
+        (let (
+                (partner-stats (default-to {
+                    total-burns: u0,
+                    total-rewards-created: u0,
+                }
+                    (map-get? PartnerBurnStats (get partner reward-data))
+                ))
+                (user-history (default-to {
+                    total-burned: u0,
+                    rewards-claimed: u0,
+                }
+                    (map-get? UserBurnHistory tx-sender)
+                ))
+            )
+            (map-set PartnerBurnStats (get partner reward-data)
+                (merge partner-stats { total-burns: (+ (get total-burns partner-stats) (get burn-cost reward-data)) })
+            )
+            (map-set UserBurnHistory tx-sender {
+                total-burned: (+ (get total-burned user-history) (get burn-cost reward-data)),
+                rewards-claimed: (+ (get rewards-claimed user-history) u1),
+            })
+        )
+        (ok reward-id)
+    )
+)
+
+(define-public (deactivate-burn-reward (reward-id uint))
+    (let ((reward-data (unwrap! (map-get? BurnRewards reward-id) ERR-REWARD-NOT-FOUND)))
+        (asserts! (is-eq tx-sender (get partner reward-data)) ERR-NOT-AUTHORIZED)
+        (map-set BurnRewards reward-id (merge reward-data { active: false }))
+        (ok true)
+    )
+)
+
+(define-public (bulk-burn-points
+        (partner principal)
+        (amount uint)
+    )
+    (let (
+            (user-points (unwrap!
+                (map-get? UserPoints {
+                    user: tx-sender,
+                    partner: partner,
+                })
+                ERR-USER-NOT-FOUND
+            ))
+            (partner-data (unwrap! (map-get? Partners partner) ERR-PARTNER-NOT-FOUND))
+        )
+        (asserts! (get active partner-data) ERR-NOT-AUTHORIZED)
+        (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+        (asserts! (>= (get balance user-points) amount)
+            ERR-INSUFFICIENT-BURN-POINTS
+        )
+        (unwrap! (deduct-points tx-sender partner amount) ERR-INSUFFICIENT-POINTS)
+        (unwrap! (deduct-from-total tx-sender amount) ERR-INSUFFICIENT-POINTS)
+        (let (
+                (partner-stats (default-to {
+                    total-burns: u0,
+                    total-rewards-created: u0,
+                }
+                    (map-get? PartnerBurnStats partner)
+                ))
+                (user-history (default-to {
+                    total-burned: u0,
+                    rewards-claimed: u0,
+                }
+                    (map-get? UserBurnHistory tx-sender)
+                ))
+            )
+            (map-set PartnerBurnStats partner
+                (merge partner-stats { total-burns: (+ (get total-burns partner-stats) amount) })
+            )
+            (map-set UserBurnHistory tx-sender
+                (merge user-history { total-burned: (+ (get total-burned user-history) amount) })
+            )
+        )
+        (ok amount)
+    )
+)
+
+(define-read-only (get-burn-reward-info (reward-id uint))
+    (ok (unwrap! (map-get? BurnRewards reward-id) ERR-REWARD-NOT-FOUND))
+)
+
+(define-read-only (get-user-burn-claim-status
+        (user principal)
+        (reward-id uint)
+    )
+    (ok (default-to { claimed: false }
+        (map-get? UserBurnClaims {
+            user: user,
+            reward-id: reward-id,
+        })
+    ))
+)
+
+(define-read-only (get-partner-burn-stats (partner principal))
+    (ok (default-to {
+        total-burns: u0,
+        total-rewards-created: u0,
+    }
+        (map-get? PartnerBurnStats partner)
+    ))
+)
+
+(define-read-only (get-user-burn-history (user principal))
+    (ok (default-to {
+        total-burned: u0,
+        rewards-claimed: u0,
+    }
+        (map-get? UserBurnHistory user)
+    ))
+)
+
+(define-read-only (get-current-reward-id)
+    (ok (var-get reward-id-counter))
+)
