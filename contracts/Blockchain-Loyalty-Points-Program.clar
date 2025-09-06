@@ -790,3 +790,182 @@
 (define-read-only (get-current-reward-id)
     (ok (var-get reward-id-counter))
 )
+
+(define-constant ERR-GIFT-SELF (err u114))
+(define-constant ERR-GIFT-LIMIT-EXCEEDED (err u115))
+(define-constant ERR-DAILY-LIMIT-EXCEEDED (err u116))
+
+(define-data-var daily-gift-limit uint u1000)
+(define-data-var max-gift-amount uint u500)
+
+(define-map GiftTransactions
+    uint
+    {
+        sender: principal,
+        recipient: principal,
+        partner: principal,
+        amount: uint,
+        message: (string-ascii 128),
+        timestamp: uint,
+    }
+)
+
+(define-map UserGiftStats
+    principal
+    {
+        total-sent: uint,
+        total-received: uint,
+        gifts-sent-count: uint,
+        gifts-received-count: uint,
+    }
+)
+
+(define-map DailyGiftLimits
+    {
+        user: principal,
+        day: uint,
+    }
+    { amount-sent: uint }
+)
+
+(define-data-var gift-id-counter uint u0)
+
+(define-public (set-gift-limits
+        (daily-limit uint)
+        (max-amount uint)
+    )
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (asserts! (> daily-limit u0) ERR-INVALID-AMOUNT)
+        (asserts! (> max-amount u0) ERR-INVALID-AMOUNT)
+        (var-set daily-gift-limit daily-limit)
+        (var-set max-gift-amount max-amount)
+        (ok true)
+    )
+)
+
+(define-public (gift-points
+        (recipient principal)
+        (partner principal)
+        (amount uint)
+        (message (string-ascii 128))
+    )
+    (let (
+            (sender-points (unwrap!
+                (map-get? UserPoints {
+                    user: tx-sender,
+                    partner: partner,
+                })
+                ERR-USER-NOT-FOUND
+            ))
+            (partner-data (unwrap! (map-get? Partners partner) ERR-PARTNER-NOT-FOUND))
+            (current-day (/ stacks-block-height u144))
+            (daily-sent (default-to { amount-sent: u0 }
+                (map-get? DailyGiftLimits {
+                    user: tx-sender,
+                    day: current-day,
+                })
+            ))
+            (gift-id (+ (var-get gift-id-counter) u1))
+        )
+        (asserts! (not (is-eq tx-sender recipient)) ERR-GIFT-SELF)
+        (asserts! (get active partner-data) ERR-NOT-AUTHORIZED)
+        (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+        (asserts! (<= amount (var-get max-gift-amount)) ERR-GIFT-LIMIT-EXCEEDED)
+        (asserts! (>= (get balance sender-points) amount) ERR-INSUFFICIENT-POINTS)
+        (asserts!
+            (<= (+ (get amount-sent daily-sent) amount)
+                (var-get daily-gift-limit)
+            )
+            ERR-DAILY-LIMIT-EXCEEDED
+        )
+        (unwrap! (deduct-points tx-sender partner amount) ERR-INSUFFICIENT-POINTS)
+        (unwrap! (add-points recipient partner amount) ERR-INSUFFICIENT-POINTS)
+        (map-set GiftTransactions gift-id {
+            sender: tx-sender,
+            recipient: recipient,
+            partner: partner,
+            amount: amount,
+            message: message,
+            timestamp: stacks-block-height,
+        })
+        (map-set DailyGiftLimits {
+            user: tx-sender,
+            day: current-day,
+        } { amount-sent: (+ (get amount-sent daily-sent) amount) }
+        )
+        (let (
+                (sender-stats (default-to {
+                    total-sent: u0,
+                    total-received: u0,
+                    gifts-sent-count: u0,
+                    gifts-received-count: u0,
+                }
+                    (map-get? UserGiftStats tx-sender)
+                ))
+                (recipient-stats (default-to {
+                    total-sent: u0,
+                    total-received: u0,
+                    gifts-sent-count: u0,
+                    gifts-received-count: u0,
+                }
+                    (map-get? UserGiftStats recipient)
+                ))
+            )
+            (map-set UserGiftStats tx-sender {
+                total-sent: (+ (get total-sent sender-stats) amount),
+                total-received: (get total-received sender-stats),
+                gifts-sent-count: (+ (get gifts-sent-count sender-stats) u1),
+                gifts-received-count: (get gifts-received-count sender-stats),
+            })
+            (map-set UserGiftStats recipient {
+                total-sent: (get total-sent recipient-stats),
+                total-received: (+ (get total-received recipient-stats) amount),
+                gifts-sent-count: (get gifts-sent-count recipient-stats),
+                gifts-received-count: (+ (get gifts-received-count recipient-stats) u1),
+            })
+        )
+        (var-set gift-id-counter gift-id)
+        (ok gift-id)
+    )
+)
+
+(define-read-only (get-gift-transaction (gift-id uint))
+    (ok (unwrap! (map-get? GiftTransactions gift-id) ERR-REWARD-NOT-FOUND))
+)
+
+(define-read-only (get-user-gift-stats (user principal))
+    (ok (default-to {
+        total-sent: u0,
+        total-received: u0,
+        gifts-sent-count: u0,
+        gifts-received-count: u0,
+    }
+        (map-get? UserGiftStats user)
+    ))
+)
+
+(define-read-only (get-daily-gift-remaining (user principal))
+    (let (
+            (current-day (/ stacks-block-height u144))
+            (daily-sent (default-to { amount-sent: u0 }
+                (map-get? DailyGiftLimits {
+                    user: user,
+                    day: current-day,
+                })
+            ))
+        )
+        (ok (- (var-get daily-gift-limit) (get amount-sent daily-sent)))
+    )
+)
+
+(define-read-only (get-gift-limits)
+    (ok {
+        daily-limit: (var-get daily-gift-limit),
+        max-amount: (var-get max-gift-amount),
+    })
+)
+
+(define-read-only (get-current-gift-id)
+    (ok (var-get gift-id-counter))
+)
