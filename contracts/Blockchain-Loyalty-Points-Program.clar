@@ -969,3 +969,248 @@
 (define-read-only (get-current-gift-id)
     (ok (var-get gift-id-counter))
 )
+
+(define-constant ERR-ALREADY-REFERRED (err u117))
+(define-constant ERR-SELF-REFERRAL (err u118))
+(define-constant ERR-NO-REFERRER (err u119))
+(define-constant ERR-REFERRAL-INACTIVE (err u120))
+
+(define-data-var referral-bonus-percentage uint u10)
+(define-data-var referral-system-active bool true)
+(define-data-var max-referral-bonus uint u100)
+
+(define-map UserReferrals
+    principal
+    {
+        referrer: principal,
+        referral-code: uint,
+        total-referrals: uint,
+        total-bonus-earned: uint,
+        active: bool,
+    }
+)
+
+(define-map ReferralEarnings
+    {
+        referrer: principal,
+        partner: principal,
+    }
+    { earnings: uint }
+)
+
+(define-map ReferralActivity
+    principal
+    {
+        referee-count: uint,
+        lifetime-earnings: uint,
+        last-bonus-block: uint,
+    }
+)
+
+(define-public (set-referral-bonus-percentage (percentage uint))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (asserts! (<= percentage u100) ERR-INVALID-AMOUNT)
+        (var-set referral-bonus-percentage percentage)
+        (ok true)
+    )
+)
+
+(define-public (toggle-referral-system (active bool))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (var-set referral-system-active active)
+        (ok true)
+    )
+)
+
+(define-public (set-max-referral-bonus (max-bonus uint))
+    (begin
+        (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-AUTHORIZED)
+        (asserts! (> max-bonus u0) ERR-INVALID-AMOUNT)
+        (var-set max-referral-bonus max-bonus)
+        (ok true)
+    )
+)
+
+(define-public (register-referral (referrer principal))
+    (let (
+            (existing-referral (map-get? UserReferrals tx-sender))
+            (referrer-data (default-to {
+                referrer: tx-sender,
+                referral-code: u0,
+                total-referrals: u0,
+                total-bonus-earned: u0,
+                active: true,
+            }
+                (map-get? UserReferrals referrer)
+            ))
+            (referrer-activity (default-to {
+                referee-count: u0,
+                lifetime-earnings: u0,
+                last-bonus-block: u0,
+            }
+                (map-get? ReferralActivity referrer)
+            ))
+        )
+        (asserts! (var-get referral-system-active) ERR-REFERRAL-INACTIVE)
+        (asserts! (is-none existing-referral) ERR-ALREADY-REFERRED)
+        (asserts! (not (is-eq tx-sender referrer)) ERR-SELF-REFERRAL)
+        (map-set UserReferrals tx-sender {
+            referrer: referrer,
+            referral-code: (+ (get referee-count referrer-activity) u1),
+            total-referrals: u0,
+            total-bonus-earned: u0,
+            active: true,
+        })
+        (map-set ReferralActivity referrer {
+            referee-count: (+ (get referee-count referrer-activity) u1),
+            lifetime-earnings: (get lifetime-earnings referrer-activity),
+            last-bonus-block: stacks-block-height,
+        })
+        (ok true)
+    )
+)
+
+(define-public (issue-points-with-referral-bonus
+        (user principal)
+        (amount uint)
+    )
+    (let (
+            (partner-data (unwrap! (map-get? Partners tx-sender) ERR-PARTNER-NOT-FOUND))
+            (multiplied-amount (* amount (get points-multiplier partner-data)))
+            (referee-data (map-get? UserReferrals user))
+        )
+        (asserts! (get active partner-data) ERR-NOT-AUTHORIZED)
+        (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+        (unwrap! (add-points user tx-sender multiplied-amount)
+            ERR-INSUFFICIENT-POINTS
+        )
+        (unwrap! (add-to-total user multiplied-amount) ERR-INSUFFICIENT-POINTS)
+        (match referee-data
+            referral-info (let (
+                    (referrer (get referrer referral-info))
+                    (bonus-amount (/ (* multiplied-amount (var-get referral-bonus-percentage))
+                        u100
+                    ))
+                    (capped-bonus (if (<= bonus-amount (var-get max-referral-bonus))
+                        bonus-amount
+                        (var-get max-referral-bonus)
+                    ))
+                )
+                (if (and
+                        (get active referral-info)
+                        (var-get referral-system-active)
+                        (> capped-bonus u0)
+                    )
+                    (begin
+                        (unwrap! (add-points referrer tx-sender capped-bonus)
+                            ERR-INSUFFICIENT-POINTS
+                        )
+                        (unwrap! (add-to-total referrer capped-bonus)
+                            ERR-INSUFFICIENT-POINTS
+                        )
+                        (let (
+                                (referrer-earnings (default-to { earnings: u0 }
+                                    (map-get? ReferralEarnings {
+                                        referrer: referrer,
+                                        partner: tx-sender,
+                                    })
+                                ))
+                                (referrer-activity (default-to {
+                                    referee-count: u0,
+                                    lifetime-earnings: u0,
+                                    last-bonus-block: u0,
+                                }
+                                    (map-get? ReferralActivity referrer)
+                                ))
+                                (updated-referral (merge referral-info { total-bonus-earned: (+ (get total-bonus-earned referral-info)
+                                    capped-bonus
+                                ) }
+                                ))
+                            )
+                            (map-set ReferralEarnings {
+                                referrer: referrer,
+                                partner: tx-sender,
+                            } { earnings: (+ (get earnings referrer-earnings) capped-bonus) }
+                            )
+                            (map-set ReferralActivity referrer {
+                                referee-count: (get referee-count referrer-activity),
+                                lifetime-earnings: (+ (get lifetime-earnings referrer-activity)
+                                    capped-bonus
+                                ),
+                                last-bonus-block: stacks-block-height,
+                            })
+                            (map-set UserReferrals user updated-referral)
+                            (ok {
+                                amount: multiplied-amount,
+                                bonus: capped-bonus,
+                            })
+                        )
+                    )
+                    (ok {
+                        amount: multiplied-amount,
+                        bonus: u0,
+                    })
+                )
+            )
+            (ok {
+                amount: multiplied-amount,
+                bonus: u0,
+            })
+        )
+    )
+)
+
+(define-public (deactivate-referral)
+    (let ((referral-data (unwrap! (map-get? UserReferrals tx-sender) ERR-NO-REFERRER)))
+        (map-set UserReferrals tx-sender (merge referral-data { active: false }))
+        (ok true)
+    )
+)
+
+(define-public (reactivate-referral)
+    (let ((referral-data (unwrap! (map-get? UserReferrals tx-sender) ERR-NO-REFERRER)))
+        (asserts! (var-get referral-system-active) ERR-REFERRAL-INACTIVE)
+        (map-set UserReferrals tx-sender (merge referral-data { active: true }))
+        (ok true)
+    )
+)
+
+(define-read-only (get-referral-info (user principal))
+    (ok (unwrap! (map-get? UserReferrals user) ERR-NO-REFERRER))
+)
+
+(define-read-only (get-referral-activity (referrer principal))
+    (ok (default-to {
+        referee-count: u0,
+        lifetime-earnings: u0,
+        last-bonus-block: u0,
+    }
+        (map-get? ReferralActivity referrer)
+    ))
+)
+
+(define-read-only (get-referral-earnings
+        (referrer principal)
+        (partner principal)
+    )
+    (ok (default-to { earnings: u0 }
+        (map-get? ReferralEarnings {
+            referrer: referrer,
+            partner: partner,
+        })
+    ))
+)
+
+(define-read-only (get-referral-settings)
+    (ok {
+        bonus-percentage: (var-get referral-bonus-percentage),
+        system-active: (var-get referral-system-active),
+        max-bonus: (var-get max-referral-bonus),
+    })
+)
+
+(define-read-only (check-referral-eligibility (user principal))
+    (ok (is-none (map-get? UserReferrals user)))
+)
