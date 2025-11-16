@@ -1214,3 +1214,56 @@
 (define-read-only (check-referral-eligibility (user principal))
     (ok (is-none (map-get? UserReferrals user)))
 )
+
+(define-read-only (get-user-overview (user principal))
+    (let (
+            (total-points-data (default-to { total: u0 } (map-get? TotalPoints user)))
+            (total-points (get total total-points-data))
+            (tier-data (default-to {
+                current-tier: TIER-BRONZE,
+                tier-points: u0,
+                tier-multiplier: u100,
+            }
+                (map-get? UserTiers user)
+            ))
+            (burn-history (default-to {
+                total-burned: u0,
+                rewards-claimed: u0,
+            }
+                (map-get? UserBurnHistory user)
+            ))
+            (gift-stats (default-to {
+                total-sent: u0,
+                total-received: u0,
+                gifts-sent-count: u0,
+                gifts-received-count: u0,
+            }
+                (map-get? UserGiftStats user)
+            ))
+            (referral-info (map-get? UserReferrals user))
+            (referral-activity (default-to {
+                referee-count: u0,
+                lifetime-earnings: u0,
+                last-bonus-block: u0,
+            }
+                (map-get? ReferralActivity user)
+            ))
+        )
+        (ok {
+            total-points: total-points,
+            tier: tier-data,
+            burn: burn-history,
+            gifts: gift-stats,
+            referral: (default-to {
+                referrer: user,
+                referral-code: u0,
+                total-referrals: u0,
+                total-bonus-earned: u0,
+                active: false,
+            }
+                referral-info
+            ),
+            referral-activity: referral-activity,
+        })
+    )
+)
